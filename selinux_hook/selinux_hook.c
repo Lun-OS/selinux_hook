@@ -1,6 +1,6 @@
 /*
  * Audit and filter SELinux access queries that probe Magisk contexts.
- * 由Lun.在2026=05-25作最小化改动补丁以修复fp/ap泄漏问题
+ * 由Lun.在2026=05-26作补丁以修复fp/ap泄漏问题
  * The safe point for transaction queries is the selinuxfs write_op table,
  * where /sys/fs/selinux/access and /sys/fs/selinux/context still have the
  * original query text.  procattr writes are filtered at security_setprocattr().
@@ -8,7 +8,7 @@
  * where the Magisk type/context does not exist.
  */
 
- /* 我的状态be like：
+ /* 我的精神状态be like：
                ............................ ............. :................................         
              ............................ :. ............ -.................................        
             ............. ................=.............. =: ................. ...............      
@@ -74,14 +74,15 @@
 #include <security.h>
 #include <ksyms.h>
 #include <hook.h>
+#include <syscall.h>
 #include <kpmodule.h>
 #include <kputils.h>
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-3"
+#define SELINUX_VERSION "1.1.7-fix-beta-6"
 #endif
-KPM_VERSION("1.1.7-fix-beta-3");
+KPM_VERSION("1.1.7-fix-beta-6");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
 KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
@@ -474,6 +475,10 @@ static bool g_clean_policy_has_magisk;
 static struct selinux_load_state g_clean_load_state;
 static bool g_clean_load_state_ready;
 static bool g_clean_policydb_direct;
+/* selinuxfs 层钩子是否触发过：before_sel_write_access/_context 顶部置位。
+ * 健康检查输入——系统调用层看到 selinuxfs 流量但此标志为假，说明
+ * selinuxfs 层因 LTO/符号问题未生效，触发系统调用层全量模式（beta-6）。 */
+static bool g_selinuxfs_layer_alive;
 static bool g_clean_sidtab_convert_canceled;
 static void *g_clean_policydb;
 static void *g_first_policy;
@@ -3043,7 +3048,7 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
     // if (current_uid() < 10000 || current_is_policy_manager()) {
-    //     return; 
+    //     return;
     // }
     // pr_info("[selinux_hook] before_sel_write_access called uid=%u\n", current_uid());
     const char *query = (const char *)a->arg1;
@@ -3053,6 +3058,8 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     u32 slot;
     u32 n;
     uid_t uid;
+
+    WRITE_ONCE(g_selinuxfs_layer_alive, true);
 
     a->local.data0 = 0;
     a->local.data1 = 0;
@@ -3193,6 +3200,8 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     u32 slot;
     u32 n;
     uid_t uid;
+
+    WRITE_ONCE(g_selinuxfs_layer_alive, true);
 
     a->local.data0 = 0;
     a->local.data1 = 0;
@@ -3499,61 +3508,84 @@ static int install_write_op_hooks(void)
         write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
         log_symbol_addr("write_op", write_op);
         if (!write_op) {
-            pr_err("[selinux_hook] write_op missing on 4.9\n");
-            return -ENOENT;
+            pr_err("[selinux_hook] write_op missing on 4.9, selinuxfs layer disabled (syscall layer remains)\n");
+            return 0;
         }
 
         g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
         g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
 
         if (!READ_ONCE(*g_write_op_context_slot)) {
-            pr_err("[selinux_hook] write_op context slot is empty\n");
-            return -ENOENT;
+            pr_err("[selinux_hook] write_op context slot is empty, selinuxfs layer disabled (syscall layer remains)\n");
+            return 0;
         }
         if (!READ_ONCE(*g_write_op_access_slot)) {
-            pr_err("[selinux_hook] write_op access slot is empty\n");
-            return -ENOENT;
+            pr_err("[selinux_hook] write_op access slot is empty, selinuxfs layer disabled (syscall layer remains)\n");
+            return 0;
         }
 
         rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
                                     &g_orig_write_op_access);
         if (rc) {
-            pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
-            return rc;
+            pr_err("[selinux_hook] patch write_op access failed rc=%d, selinuxfs layer disabled (syscall layer remains)\n",
+                   rc);
+            return 0;
         }
         g_write_op_access_patched = true;
 
         rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
                                     &g_orig_write_op_context);
         if (rc) {
-            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
-            uninstall_write_op_hooks();
-            return rc;
+            pr_err("[selinux_hook] patch write_op context failed rc=%d, access slot kept, context covered by syscall layer\n",
+                   rc);
+        } else {
+            g_write_op_context_patched = true;
         }
-        g_write_op_context_patched = true;
 
         pr_info("[selinux_hook] hook sel_write_context argc=3 mode=write_op[5] 4.9\n");
         pr_info("[selinux_hook] hook sel_write_access argc=3 mode=write_op[6] 4.9\n");
         return 0;
     }
 
-    /* Non-4.9 / 非 4.9：保持原来的 direct-symbol-first hook 顺序。 */
+    /*
+     * Non-4.9 / 非 4.9：direct inline hook 优先；hook_wrap 失败或符号缺失时
+     * 逐级回退到 write_op[] 表补丁（beta-6 新增钩子方法回退）。
+     * 所有失败都不再使 init 返回错误——模块保持加载，系统调用层
+     * （sc_install）兜底，健康检查会在 selinuxfs 层失效时自动升级为
+     * 全量 deny。宁可少一层拦截，也不冒加载回滚的风险。
+     */
     if (addr_access) {
+        hook_err_t hrc;
+
         g_funcs[g_hooks++] = (void *)addr_access;
         pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
-        hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
+        hrc = hook_wrap((void *)addr_access, 3, before_sel_write_access,
+                        after_sel_write_common, NULL);
         selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
+
+        if (hrc) {
+            pr_warn("[selinux_hook] inline hook sel_write_access failed rc=%d, falling back to write_op[]\n",
+                    hrc);
+            g_hooks--;
+            goto write_op_fallback;
+        }
 
         if (addr_context) {
             g_funcs[g_hooks++] = (void *)addr_context;
             pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
-            hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
+            hrc = hook_wrap((void *)addr_context, 3, before_sel_write_context,
+                            after_sel_write_common, NULL);
             selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
+            if (hrc)
+                pr_warn("[selinux_hook] inline hook sel_write_context failed rc=%d, context covered by syscall layer\n",
+                        hrc);
         } else {
             pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
         }
         return 0;
     }
+
+write_op_fallback:
 
     /*
      * write_op[] fallback notes:
@@ -3588,23 +3620,24 @@ static int install_write_op_hooks(void)
     write_op = (sel_write_op_fn *)lookup_name_optional_suffix("write_op");
     log_symbol_addr("write_op", write_op);
     if (!write_op) {
-        pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
-        return -ENOENT;
+        pr_err("[selinux_hook] cannot find sel_write_access or write_op, selinuxfs layer disabled (syscall layer remains)\n");
+        return 0;
     }
 
     g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
     g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
 
     if (!READ_ONCE(*g_write_op_access_slot)) {
-        pr_err("[selinux_hook] write_op access slot is empty\n");
-        return -ENOENT;
+        pr_err("[selinux_hook] write_op access slot is empty, selinuxfs layer disabled (syscall layer remains)\n");
+        return 0;
     }
 
     rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
                                 &g_orig_write_op_access);
     if (rc) {
-        pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
-        return rc;
+        pr_err("[selinux_hook] patch write_op access failed rc=%d, selinuxfs layer disabled (syscall layer remains)\n",
+               rc);
+        return 0;
     }
     g_write_op_access_patched = true;
 
@@ -3612,11 +3645,11 @@ static int install_write_op_hooks(void)
         rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
                                     &g_orig_write_op_context);
         if (rc) {
-            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
-            uninstall_write_op_hooks();
-            return rc;
+            pr_err("[selinux_hook] patch write_op context failed rc=%d, access slot kept, context covered by syscall layer\n",
+                   rc);
+        } else {
+            g_write_op_context_patched = true;
         }
-        g_write_op_context_patched = true;
     } else {
         pr_warn("[selinux_hook] write_op context slot is empty\n");
     }
@@ -4206,6 +4239,224 @@ static void before_security_read_policy_compat(hook_fargs3_t *a, void *u)
     before_security_read_policy_common(a, (void **)a->arg1, (size_t *)a->arg2);
 }
 
+/*
+ * ===================== 系统调用层兜底过滤（beta-5 新增） =====================
+ *
+ * 动机：5.x qgki 内核 LTO 会把 SELinux 内部函数（context_struct_compute_av、
+ * security_context_to_sid 等）内联进调用点，inline hook 挂上了但不触发
+ * （看雪 291665 在 5.4.210-qgki 实测），导致 >=4.15 上唯一的 context 隐藏
+ * 机制（clean 重定向）失效。本层挂 KP 的系统调用表函数指针
+ * （fp_hook_syscalln，零符号解析、与 LTO/CFI 无关），在 write() 进入 VFS
+ * 之前对 selinuxfs 事务节点的写入做 deny 类预过滤。
+ *
+ * 与 selinuxfs 层钩子的关系：叠加而非替代。本层 deny 的查询 selinuxfs 层
+ * 不会再看到（syscall 先于 VFS）；放行的查询照常走 selinuxfs 层的完整逻辑
+ * （mode=5 应答、重定向等）。两边判定标准一致（deny 的都是 marker 探针），
+ * 不会出现双重处理或答案冲突。
+ *
+ * 范围（v1，刻意收窄）：
+ *   - 只拦 marker 探针（magisk/ksu/lsposed/xposed/adbroot/sukisu/apatch/
+ *     kernelpatch 子串）——DirtySepolicy 的 contextExists 与 binder 探针目标，
+ *     与未 root 设备的应答（-EINVAL）逐位同形；
+ *   - class=0 的 25 字节应答与 8 对探针仍由 selinuxfs 层负责（系统调用层
+ *     拿不到 simple_transaction 的应答页，给不了成功形状的合成应答）；
+ *   - 32 位 compat syscall 未覆盖（检测器为 64 位 app 进程）。
+ *
+ * 失败模式全部 fail-open：f_op 布局镜像不符 → 比对失败放行；fget/fput
+ * 缺失或 selinuxfs 未挂载 → 本层整体不安装。任何异常都不会比 beta-4 更差。
+ */
+
+/* struct file 只读布局镜像：f_op 在 arm64 4.x-6.x 上稳定位于偏移 32
+ * （f_u 8B + f_path 16B + f_inode 8B）。KP 未导出 struct file 定义。 */
+struct sc_file_layout {
+    void *head;
+    void *f_path[2];
+    void *f_inode;
+    const void *f_op;
+};
+
+static const void *sc_fop_list[2];
+static int sc_fop_count;
+static bool sc_hooked;
+static u32 sc_writes_seen;
+static bool sc_full_mode;
+static void *(*sc_fget_fn)(unsigned int);
+static void (*sc_fput_fn)(void *);
+
+static bool sc_cache_fop(void)
+{
+    static const char *const nodes[] = { "/sys/fs/selinux/access", "/sys/fs/selinux/context" };
+    int i;
+
+    for (i = 0; i < 2 && sc_fop_count < 2; i++) {
+        struct file *filp = filp_open_fn(nodes[i], O_RDWR, 0);
+        const void *fop;
+
+        if (IS_ERR(filp) || !filp) {
+            pr_warn("[selinux_hook] SC baseline %s open failed\n", nodes[i]);
+            continue;
+        }
+
+        fop = ((const struct sc_file_layout *)filp)->f_op;
+        filp_close_fn(filp, 0);
+
+        if (!fop)
+            continue;
+        if (sc_fop_count && fop == sc_fop_list[0])
+            continue;
+        sc_fop_list[sc_fop_count++] = fop;
+        pr_info("[selinux_hook] SC selinuxfs fop cached node=%s fop=%px\n", nodes[i], fop);
+    }
+
+    return sc_fop_count > 0;
+}
+
+/* 非门控 marker 判定：uid>=10000 对 selinuxfs 事务节点的写入里出现这些
+ * 子串，只可能是检测探针（策略管理写入已在 uid 旁路放行）。 */
+static bool sc_should_deny(const char *q, size_t n)
+{
+    if (contains_case_literal(q, n, "magisk"))
+        return true;
+    if (contains_case_literal(q, n, "ksu"))
+        return true;
+    if (contains_case_literal(q, n, "lsposed"))
+        return true;
+    if (contains_case_literal(q, n, "xposed"))
+        return true;
+    if (contains_case_literal(q, n, "adbroot"))
+        return true;
+    if (contains_case_literal(q, n, "sukisu"))
+        return true;
+    if (contains_case_literal(q, n, "apatch"))
+        return true;
+    if (contains_case_literal(q, n, "kernelpatch"))
+        return true;
+    return false;
+}
+
+/* 全量模式专用：与上游 <4.15 的 8 对探针表同语义。仅在健康检查确认
+ * selinuxfs 层失效（LTO 内联/符号缺失，重定向不可能工作）时启用，
+ * 作为重定向的替代，而非常态抢答——常态下这些查询由 clean 重定向
+ * 给出与干净设备一致的判决。 */
+static bool sc_should_deny_full(const char *q, size_t n)
+{
+    if (access_contexts_match(q, "u:r:system_server:s0", "u:r:system_server:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:shell:s0", "u:r:su:s0"))
+        return true;
+    if (access_contexts_match(q, "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:kernel:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:kernel:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:system_server:s0", "u:object_r:apk_data_file:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0"))
+        return true;
+    if (access_contexts_match(q, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+    return false;
+}
+
+static void before_sys_write(hook_fargs3_t *a, void *u)
+{
+    const char __user *buf;
+    struct file *file;
+    char sample[ACCESS_SAMPLE_MAX];
+    size_t count;
+    size_t n;
+    u64 fd;
+    int i;
+
+    if (!sc_fop_count) {
+        /* selinuxfs 未就绪（模块早于 selinuxfs 挂载加载）时的懒重试：
+         * 每 64 次 write 尝试重新缓存一次 f_op，成功即启用本层。 */
+        static u32 retry;
+
+        if (++retry >= 64) {
+            retry = 0;
+            sc_cache_fop();
+        }
+        return;
+    }
+
+    fd = syscall_argn(a, 0);
+    buf = (const char __user *)syscall_argn(a, 1);
+    count = (size_t)syscall_argn(a, 2);
+
+    if (fd < 3 || count < 8 || count > 800)
+        return;
+    if (should_bypass_clean_filter(current_uid()))
+        return;
+
+    file = sc_fget_fn((unsigned int)fd);
+    if (!file)
+        return;
+
+    for (i = 0; i < sc_fop_count; i++) {
+        if (((const struct sc_file_layout *)file)->f_op == sc_fop_list[i])
+            break;
+    }
+    sc_fput_fn(file);
+    if (i >= sc_fop_count)
+        return;
+
+    /* 健康检查：本层确认有 selinuxfs 探针流量，而 selinuxfs 层钩子从未
+     * 触发 → LTO 内联/符号缺失使重定向不可能工作，升级为全量 deny
+     * （8 对探针 + marker），恢复与上游 <4.15 等价的隐藏强度。 */
+    n = READ_ONCE(sc_writes_seen) + 1;
+    WRITE_ONCE(sc_writes_seen, n);
+    if (!sc_full_mode && !READ_ONCE(g_selinuxfs_layer_alive) && n >= 16) {
+        WRITE_ONCE(sc_full_mode, true);
+        pr_info("[selinux_hook] SC escalate: selinuxfs layer silent after %u writes, full deny mode engaged\n",
+                n);
+    }
+
+    n = copy_query_sample(sample, buf, count);
+    if (!n)
+        return;
+
+    if (sc_should_deny(sample, n) ||
+        (sc_full_mode && sc_should_deny_full(sample, n))) {
+        a->skip_origin = 1;
+        a->ret = (uint64_t)-EINVAL;
+        pr_info("[selinux_hook] SC deny uid=%d comm=%s query=\"%s\"\n",
+                current_uid(), current_comm(), sample);
+    }
+}
+
+static void sc_install(void)
+{
+    sc_fget_fn = (void *(*)(unsigned int))lookup_name_optional_suffix("fget");
+    sc_fput_fn = (void (*)(void *))lookup_name_optional_suffix("fput");
+
+    if (!sc_fget_fn || !sc_fput_fn) {
+        pr_warn("[selinux_hook] SC fget/fput unresolved, syscall layer disabled\n");
+        return;
+    }
+    if (!sc_cache_fop()) {
+        pr_warn("[selinux_hook] SC selinuxfs fop unavailable, syscall layer disabled\n");
+        return;
+    }
+
+    if (fp_hook_syscalln(__NR_write, 3, before_sys_write, NULL, NULL)) {
+        pr_warn("[selinux_hook] SC fp_hook_syscalln(write) failed, syscall layer disabled\n");
+        return;
+    }
+
+    sc_hooked = true;
+    pr_info("[selinux_hook] SC syscall-layer write hook installed fop_n=%d\n", sc_fop_count);
+}
+
+static void sc_uninstall(void)
+{
+    if (sc_hooked) {
+        fp_unhook_syscalln(__NR_write, before_sys_write, NULL);
+        sc_hooked = false;
+    }
+}
+
 static long init(const char *args, const char *event, void *__user r)
 {
     unsigned long addr;
@@ -4531,6 +4782,8 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_policy_commit\n");
     }
 
+    sc_install();
+
     selinux_hook_dbg("[selinux_hook] %d hooks installed\n", g_hooks);
     return 0;
 }
@@ -4538,6 +4791,7 @@ static long init(const char *args, const char *event, void *__user r)
 static long exit_(void *__user r)
 {
     WRITE_ONCE(g_write_op_install_deferred, false);
+    sc_uninstall();
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
 

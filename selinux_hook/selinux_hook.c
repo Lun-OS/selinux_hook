@@ -1,13 +1,12 @@
 /*
  * Audit and filter SELinux access queries that probe Magisk contexts.
- * 2026-09-24/25 由Lun.进行补丁修复；Patch fix by Lun. on 2026-09-24/25;中秋节快乐
+ * 由Lun.在2026=05-25作最小化改动补丁以修复fp/ap泄漏问题
  * The safe point for transaction queries is the selinuxfs write_op table,
  * where /sys/fs/selinux/access and /sys/fs/selinux/context still have the
  * original query text.  procattr writes are filtered at security_setprocattr().
  * Returning -EINVAL for Magisk contexts matches the clean-policy behavior
  * where the Magisk type/context does not exist.
  */
-
 
  /* 我的状态be like：
                ............................ ............. :................................         
@@ -62,7 +61,6 @@
           ....... -@@@@@.          .@@@@@@@@@@@@@@@@@@@@@@@@@@*           %@@@@@@@@- ........       
 
 */
-
 #include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
@@ -79,23 +77,14 @@
 #include <kpmodule.h>
 #include <kputils.h>
 
-
-
-// ------------------KPM信息-------------
-
-KPM_NAME("selinux_hook");
+KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.7-fix-beta-2"
+#define SELINUX_VERSION "1.1.7-fix-beta-3"
 #endif
-KPM_VERSION(SELINUX_VERSION);
+KPM_VERSION("1.1.7-fix-beta-3");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
-KPM_DESCRIPTION("隐藏SELinux上下文，并漏洞补丁修复");
-// -------------------------------------
-
-
-
-
+KPM_DESCRIPTION("隐藏SELinux修改，并增加漏洞补丁");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
@@ -117,15 +106,7 @@ KPM_DESCRIPTION("隐藏SELinux上下文，并漏洞补丁修复");
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
-/*
- * 内部 root 名单 / 内置管理器包名（参考 APKey_Hide 的 3 包名表）。
- * 名单里的包名通过 /data/system/packages.list 映射成 UID，UID 无法被
- * 普通进程伪造，比 comm 匹配更可靠；所有内核版本都启用该旁路。
- */
-#define MANAGER_PACKAGE_MAX 8
-#define MANAGER_PKG_NAME_MAX 64
-#define MANAGER_UID_MAX MANAGER_PACKAGE_MAX
-#define MANAGER_UID_PROBE_BUDGET 4
+#define APATCH_MANAGER_PACKAGE "me.bmax.apatch"
 #define APATCH_PACKAGES_LIST_PATH "/data/system/packages.list"
 #define APATCH_PACKAGES_LIST_MAX_SIZE (1024 * 1024)
 #ifndef APATCH_MANAGER_UID
@@ -139,13 +120,6 @@ static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
 extern unsigned long *pgtable_entry(unsigned long pgd, unsigned long va);
-/*
- * KP base 导出（kernel/base/symbol.c，任何 KP 构建都有）。用它按名字解析
- * KP_EXPORT_SYMBOL 出来的符号：只有 Android 分支的 KP 才导出
- * is_trusted_manager_uid_android，直接 extern 会让非 Android 分支的模块
- * 因 SHN_UNDEF 解析失败而【整个不加载】；运行时解析不到只降级。
- */
-extern unsigned long symbol_lookup_name(const char *name);
 static sel_write_op_fn *g_write_op_access_slot;
 static sel_write_op_fn *g_write_op_context_slot;
 static sel_write_op_fn g_orig_write_op_access;
@@ -519,22 +493,7 @@ static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
 static bool g_simple_read_from_buffer_hooked;
-/* 内部 root 名单：管理器包名表 + 由 packages.list 解析出的 UID 名单。 */
-static char g_manager_pkg_storage[MANAGER_PACKAGE_MAX][MANAGER_PKG_NAME_MAX];
-static const char *g_manager_packages[MANAGER_PACKAGE_MAX];
-static u32 g_manager_package_count;
-static uid_t g_manager_uids[MANAGER_UID_MAX];
-static char g_manager_uid_names[MANAGER_UID_MAX][MANAGER_PKG_NAME_MAX];
-static u32 g_manager_uid_count;
-static u32 g_manager_uid_probe_budget = MANAGER_UID_PROBE_BUDGET;
-/*
- * KP 原生受信管理器锚点（移植自 APKey_Hide v3.6 的信任链）：
- * is_trusted_manager_uid_android() 由 KP 自己按「内置包名 + APK 签名摘要」
- * 判定（userd.c），与我们的读文件时机【无关】，是 packages.list 名单之外的
- * 第二信任源。签名不可伪造 ⇒ 不新增任何可仿冒面。
- */
-typedef int (*kp_trusted_manager_fn_t)(uid_t uid);
-static kp_trusted_manager_fn_t g_kp_trusted_manager_fn;
+static uid_t g_apatch_manager_uid = APATCH_MANAGER_UID;
 
 struct access_probe {
     u32 id;
@@ -576,13 +535,6 @@ static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
 static bool dirtysepolicy_context_should_hide(const char *query);
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
-
-/*
- * 【1.5.3】把策略快照 blob 里的根标记类型名原地等长改名，返回改掉的名字个数。
- * 定义在根标记表旁边；这里先声明，因为两个快照保存点（~1850 / ~2010）要用到，
- * 而它们都在表定义之前。
- */
-static u32 sanitize_blob_names(char *blob, size_t len);
 static bool clean_context_exists(const char *query);
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
 static bool legacy_should_block_access_query(const char *query, size_t len);
@@ -779,46 +731,6 @@ static u32 get_u32_le(const unsigned char *src)
            ((u32)src[3] << 24);
 }
 
-/*
- * The seqno a clean device reports from /sys/fs/selinux/access.
- *
- * avd_init() seeds it with `avd->seqno = state->ss->latest_granting;`, and
- * latest_granting is a zero-initialised static counter that
- * security_load_policy() PRE-increments once per successful load (plus one
- * more per boolean flip).  A clean device loads its policy exactly once at
- * boot and never flips a boolean, so the honest answer for this node is 1.
- *
- * This is a SINGLE CONSTANT ON PURPOSE -- upstream 1.1.7 used the literal 1 in
- * both /access writers and did not branch on the kernel version here.  Any
- * version test would have to guess how many times a given kernel loads policy
- * before userspace first looks, and a wrong guess yields a value that is not
- * merely suspicious but UNREACHABLE on every kernel: 0, which latest_granting
- * can never hold once a policy has been loaded.  A constant that stays
- * reachable on any version beats a version-keyed guess.
- */
-#define SELINUX_CLEAN_ACCESS_SEQNO 1
-
-/*
- * /status is a DIFFERENT counter, and it is the one place that genuinely needs
- * the version split -- exactly as upstream had it.
- *
- * The status page is allocated lazily on the first open()/mmap() of the node,
- * and selinux_kernel_status_page() seeds both sequence and policyload with the
- * literal 0.  They only advance if a policy load happens while the page already
- * exists.  On kernels that load policy several times before anything opens
- * /status, the page is therefore born holding sequence=4 / policyload=1, which
- * is the pair the detector expects to see there.
- */
-static u32 clean_status_sequence(void)
-{
-    return (kver >= VERSION(6, 7, 0)) ? SELINUX_STATUS_CLEAN_SEQUENCE : 0u;
-}
-
-static u32 clean_status_policyload(void)
-{
-    return (kver >= VERSION(6, 7, 0)) ? SELINUX_STATUS_CLEAN_POLICYLOAD : 0u;
-}
-
 static void fill_clean_status_bytes(unsigned char *status)
 {
     u32 seq, pload;
@@ -826,8 +738,18 @@ static void fill_clean_status_bytes(unsigned char *status)
     if (!status)
         return;
 
-    seq   = clean_status_sequence();
-    pload = clean_status_policyload();
+    /* kernel >= 6.6: detection expects sequence=4 policyload=1
+     * kernel <  6.6: detection expects sequence=0 policyload=0
+     * (Java isNewKernel() uses >= 6.10 as threshold, we use 6.6 to
+     *  be safe and avoid false positives on kernels in between)
+     */
+    if (kver >= VERSION(6, 7, 0)) {
+        seq   = SELINUX_STATUS_CLEAN_SEQUENCE;
+        pload = SELINUX_STATUS_CLEAN_POLICYLOAD;
+    } else {
+        seq   = 0;
+        pload = 0;
+    }
 
     zero_bytes(status, SELINUX_STATUS_SIZE);
     put_u32_le(status + 0,  1);
@@ -948,69 +870,17 @@ static bool clean_policydb_redirect_supported(void)
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
-/*
- * 内部 root 名单命中判定：UID 由 packages.list 的包名映射而来，普通进程
- * 无法伪造（不同于 comm），因此该判定可以直接用作 LIVE 旁路门控。
- */
-static bool uid_in_manager_list(uid_t uid)
-{
-    u32 n = READ_ONCE(g_manager_uid_count);
-    u32 i;
-
-    for (i = 0; i < n && i < MANAGER_UID_MAX; i++) {
-        if (READ_ONCE(g_manager_uids[i]) == uid)
-            return true;
-    }
-
-    return false;
-}
-
-/*
- * KP 签名级受信管理器判定（移植自 APKey_Hide v3.6）。
- *
- * 为什么必需：嵌入模式下模块在 pre-kernel-init 事件里由 KP 自己加载（t≈0.3s），
- * 此时 /data 还没挂载 ⇒ packages.list 读不到 ⇒ 内部 root 名单为空。预算修复
- * （见 try_refine_manager_uids）已经让"文件读不到不扣预算"，等 /data 就绪后
- * 能补上名单；但"补上"依赖后续有 uid==0 的探测事件到达。KP 这个锚点是
- * **与读取时机完全无关**的第二信任源：值来自 KP 自己的签名校验，不依赖
- * 本模块何时读到文件，两条链并联后就不再存在"名单为空 ⇒ 管理器被误杀"的窗口。
- *
- * KP 的锚点按「内置包名 + APK 签名摘要」判定（伪造成本 = 私钥），也不依赖
- * comm。注意它在 `trusted_manager_uid == (uid_t)-1`（KP 尚未匹配出来，即开机
- * 早期）时返回 0，语义是"不是受信管理器"而非"不知道" —— 因此它只能做**加法**
- * （把真管理器救回来），不能做减法：任何一条链给出肯定答案即可放行。
- * 解析不到就静默降级（非 Android 分支的 KP 不导出该符号），不影响其余任何逻辑。
- */
-static bool kp_trusted_manager(uid_t uid)
-{
-    if (!g_kp_trusted_manager_fn)
-        return false;
-
-    return g_kp_trusted_manager_fn(uid) != 0;
-}
-
 static bool current_is_policy_manager(void)
 {
     const char *comm = current_comm();
     uid_t uid = current_uid();
 
-    /*
-     * 内部 root 名单（全内核生效 / all kernels）：管理器 UID 直接放行，
-     * 避免误拦管理器自身的策略查询。此前该旁路仅 4.9 生效，而实际管理器
-     * 包名（如 me.yuki.aster）不在单一硬编码包名里，导致 4.14+ 设备上
-     * 管理器永远进不了 bypass 分支。
-     */
-    if (uid_in_manager_list(uid))
-        return true;
-
-    /*
-     * 第二信任源：KP 原生签名级锚点。放在 uid>=10000 分支里 —— 应用段 uid
-     * 拿不到 comm 那条捷径（下面的 comm 匹配要求 uid<10000，堵死 PR_SET_NAME
-     * 仿冒），只有这里能补上"真管理器永远可用"。uid<10000 的 root/system/adb
-     * 路径行为与改动前逐字一致，检测器（普通 app）不在 KP 受信名单里 ⇒ 不受影响。
-     */
-    if (uid >= 10000)
-        return kp_trusted_manager(uid);
+    /* 4.9 only / 仅 4.9：APatch UI 用 UID 放行，避免误拦管理器自身查询。 */
+    if (selinux_49_compat_path()) {
+        uid_t apatch_uid = READ_ONCE(g_apatch_manager_uid);
+        if (apatch_uid != (uid_t)-1 && uid == apatch_uid)
+            return true;
+    }
 
     /*
      * comm 匹配需额外要求 uid<10000。
@@ -1024,6 +894,9 @@ static bool current_is_policy_manager(void)
      * 中递归读取导致 bootloop），但额外要求 uid<10000：真管理器是 root，
      * 普通 app（uid>=10000）即使改 comm 也进不了 bypass 分支，差分消失。
      */
+    if (uid >= 10000)
+        return false;
+
     if (str_eq_lit(comm, "magiskpolicy") ||
         str_eq_lit(comm, "apd") ||
         str_eq_lit(comm, "truncate"))
@@ -1823,128 +1696,9 @@ static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count,
  * Polaris 4.9 uses a UID bypass for APatch UI reads because task names are not
  * a stable manager signal. 仅 4.9 使用该 UID 旁路，其他内核保持原来的 comm 判断。
  */
-/*
- * 内部 root 名单 / 管理器包名 → UID 解析（移植自 APKey_Hide 的内部名单机制）：
- * 在特权上下文读取 /data/system/packages.list，把名单里的每个包名映射成
- * UID。UID 无法被普通进程伪造，比 comm 匹配更可靠；所有内核版本都启用。
- * 解析失败（文件未就绪等）时由 uid==0 事件 / policy commit 触发重试，
- * 预算 MANAGER_UID_PROBE_BUDGET 次，避免每次查询都读文件。
- */
-static void manager_packages_reset_defaults(void)
+static bool package_line_starts_with_apatch(const char *line, const char *end)
 {
-    static const char * const defaults[] = {
-        "me.yuki.folk",          /* FolkPatch 管理器 */
-        "me.yuki.aster",         /* Aster 管理器（本机实际在用） */
-        "me.bmax.apatch",        /* 原版 APatch 管理器 */
-    };
-    u32 i;
-
-    for (i = 0; i < sizeof(defaults) / sizeof(defaults[0]) &&
-                i < MANAGER_PACKAGE_MAX;
-         i++) {
-        const char *pkg = defaults[i];
-        size_t j;
-
-        for (j = 0; pkg[j] && j < MANAGER_PKG_NAME_MAX - 1; j++)
-            g_manager_pkg_storage[i][j] = pkg[j];
-        g_manager_pkg_storage[i][j] = '\0';
-        g_manager_packages[i] = g_manager_pkg_storage[i];
-    }
-
-    WRITE_ONCE(g_manager_package_count,
-               (u32)(sizeof(defaults) / sizeof(defaults[0])));
-}
-
-static void copy_pkg_name(char *dst, const char *src)
-{
-    size_t i;
-
-    for (i = 0; src[i] && i < MANAGER_PKG_NAME_MAX - 1; i++)
-        dst[i] = src[i];
-    dst[i] = '\0';
-}
-
-static bool manager_uid_tracked(uid_t uid)
-{
-    u32 n = READ_ONCE(g_manager_uid_count);
-    u32 i;
-
-    for (i = 0; i < n && i < MANAGER_UID_MAX; i++) {
-        if (READ_ONCE(g_manager_uids[i]) == uid)
-            return true;
-    }
-
-    return false;
-}
-
-static bool manager_pkg_char_ok(char c)
-{
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
-}
-
-static bool manager_pkg_valid(const char *s)
-{
-    size_t len = 0;
-    bool has_dot = false;
-
-    if (!s)
-        return false;
-
-    for (; s[len]; len++) {
-        if (len >= MANAGER_PKG_NAME_MAX - 1)
-            return false;
-        if (!manager_pkg_char_ok(s[len]))
-            return false;
-        if (s[len] == '.')
-            has_dot = true;
-    }
-
-    return len >= 3 && has_dot;
-}
-
-static bool manager_package_add(const char *pkg)
-{
-    u32 n = READ_ONCE(g_manager_package_count);
-    u32 i;
-
-    if (!pkg || n >= MANAGER_PACKAGE_MAX)
-        return false;
-
-    for (i = 0; i < n; i++) {
-        if (str_eq_lit(g_manager_packages[i], pkg))
-            return true;
-    }
-
-    copy_pkg_name(g_manager_pkg_storage[n], pkg);
-    g_manager_packages[n] = g_manager_pkg_storage[n];
-    WRITE_ONCE(g_manager_package_count, n + 1);
-    pr_info("[selinux_hook] manager package added name=%s count=%u\n", pkg,
-            n + 1);
-    return true;
-}
-
-static bool manager_uid_add(uid_t uid, const char *src)
-{
-    u32 n = READ_ONCE(g_manager_uid_count);
-
-    if (manager_uid_tracked(uid))
-        return true;
-
-    if (n >= MANAGER_UID_MAX)
-        return false;
-
-    WRITE_ONCE(g_manager_uids[n], uid);
-    copy_pkg_name(g_manager_uid_names[n], src ? src : "(manual)");
-    WRITE_ONCE(g_manager_uid_count, n + 1);
-    pr_info("[selinux_hook] manager uid added uid=%d src=%s count=%u\n", uid,
-            src ? src : "(manual)", n + 1);
-    return true;
-}
-
-static bool package_line_starts_with_pkg(const char *line, const char *end,
-                                         const char *pkg)
-{
+    const char *pkg = APATCH_MANAGER_PACKAGE;
     size_t line_len = (size_t)(end - line);
     size_t i;
 
@@ -1978,7 +1732,7 @@ static bool parse_decimal_uid(const char **cursor, const char *end, uid_t *out)
     return true;
 }
 
-static void parse_manager_packages(const char *buf, size_t len)
+static bool parse_apatch_manager_uid(const char *buf, size_t len, uid_t *out)
 {
     const char *p = buf;
     const char *end = buf + len;
@@ -1986,200 +1740,94 @@ static void parse_manager_packages(const char *buf, size_t len)
     while (p < end) {
         const char *line = p;
         const char *line_end = line;
-        u32 n = READ_ONCE(g_manager_package_count);
-        u32 i;
 
         while (line_end < end && *line_end != '\n' && *line_end != '\r')
             line_end++;
 
-        for (i = 0; i < n && i < MANAGER_PACKAGE_MAX; i++) {
-            const char *pkg = g_manager_packages[i];
-            const char *q;
-            uid_t uid;
+        if (package_line_starts_with_apatch(line, line_end)) {
+            const char *q = line;
 
-            if (!package_line_starts_with_pkg(line, line_end, pkg))
-                continue;
-
-            q = line;
             while (q < line_end && *q != ' ')
                 q++;
             while (q < line_end && *q == ' ')
                 q++;
 
-            if (parse_decimal_uid(&q, line_end, &uid) &&
-                !manager_uid_tracked(uid))
-                manager_uid_add(uid, pkg);
+            return parse_decimal_uid(&q, line_end, out);
         }
 
         while (line_end < end && (*line_end == '\n' || *line_end == '\r'))
             line_end++;
         p = line_end;
     }
+
+    return false;
 }
 
-/*
- * 返回 true 表示「确实打开并完整扫描过一次 packages.list」（无论是否命中包名），
- * 返回 false 表示这次尝试没有真正读到文件（符号缺失 / 未挂载 / 读取失败）。
- *
- * 调用方（try_refine_manager_uids）只应该在返回 true 时消耗预算 —— 与
- * APKey_Hide v3.5 的时序修复同源：嵌入模式下模块在 pre-kernel-init（t≈0.3s）
- * 加载，此时 /data 尚未挂载，早期探测必然读不到文件；若也扣预算，4 次预算会
- * 全部耗在注定失败的尝试上，等 /data 就绪后永远不再修正，管理器 UID 名单
- * 恒为空 ⇒ 管理器被根标记闸门挡下。
- */
-static bool detect_manager_uids(const char *reason)
+static void detect_apatch_manager_uid(void)
 {
     struct file *filp;
     void *data;
     loff_t len;
     loff_t pos;
     ssize_t nread;
+    uid_t uid;
 
-    /*
-     * 符号可能在 init 时还没解析出来（或用了不存在的别名），此处做一次
-     * 补解析，避免一次失败就把读文件能力永久禁用。
-     */
-    if (!vmalloc_fn)
-        vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
-    if (!vmalloc_fn)
-        vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
-    if (!vfree_fn)
-        vfree_fn = (void *)lookup_name_optional_suffix("vfree");
-    if (!filp_open_fn)
-        filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
-    if (!filp_close_fn)
-        filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
-    if (!kernel_read_fn)
-        kernel_read_fn = (void *)lookup_name_optional_suffix("kernel_read");
-    if (!vfs_llseek_fn)
-        vfs_llseek_fn = (void *)lookup_name_optional_suffix("vfs_llseek");
+    if (READ_ONCE(g_apatch_manager_uid) != (uid_t)-1) {
+        pr_info("[selinux_hook] APatch manager uid preset uid=%d\n",
+                READ_ONCE(g_apatch_manager_uid));
+        return;
+    }
 
     if (!vmalloc_fn || !vfree_fn || !filp_open_fn || !filp_close_fn ||
         !kernel_read_fn || !vfs_llseek_fn) {
-        pr_warn("[selinux_hook] manager uid detection disabled open=%px close=%px read=%px llseek=%px vmalloc=%px vfree=%px\n",
+        pr_warn("[selinux_hook] APatch manager uid detection disabled open=%px close=%px read=%px llseek=%px vmalloc=%px vfree=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn,
                 vmalloc_fn, vfree_fn);
-        return false;
+        return;
     }
 
     filp = filp_open_fn(APATCH_PACKAGES_LIST_PATH, O_RDONLY, 0);
     if (!filp || IS_ERR(filp)) {
-        pr_warn("[selinux_hook] manager uid open failed reason=%s path=%s rc=%ld\n",
-                reason ?: "(null)", APATCH_PACKAGES_LIST_PATH,
-                filp ? PTR_ERR(filp) : -ENOENT);
-        return false;
+        pr_warn("[selinux_hook] APatch manager uid open failed path=%s rc=%ld\n",
+                APATCH_PACKAGES_LIST_PATH, filp ? PTR_ERR(filp) : -ENOENT);
+        return;
     }
 
     len = vfs_llseek_fn(filp, 0, SEEK_END);
     if (len <= 0 || len > APATCH_PACKAGES_LIST_MAX_SIZE) {
-        pr_warn("[selinux_hook] manager uid bad packages.list reason=%s len=%lld\n",
-                reason ?: "(null)", len);
+        pr_warn("[selinux_hook] APatch manager uid bad packages.list len=%lld\n", len);
         filp_close_fn(filp, 0);
-        return false;
+        return;
     }
     vfs_llseek_fn(filp, 0, SEEK_SET);
 
     data = vmalloc_fn((unsigned long)len);
     if (!data) {
-        pr_warn("[selinux_hook] manager uid alloc failed reason=%s len=%lld\n",
-                reason ?: "(null)", len);
+        pr_warn("[selinux_hook] APatch manager uid alloc failed len=%lld\n", len);
         filp_close_fn(filp, 0);
-        return false;
+        return;
     }
 
     pos = 0;
     nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
     filp_close_fn(filp, 0);
     if (nread != len || pos != len) {
-        pr_warn("[selinux_hook] manager uid read failed reason=%s read=%ld pos=%lld len=%lld\n",
-                reason ?: "(null)", (long)nread, pos, len);
+        pr_warn("[selinux_hook] APatch manager uid read failed read=%ld pos=%lld len=%lld\n",
+                (long)nread, pos, len);
         vfree_fn(data);
-        return false;
+        return;
     }
 
-    parse_manager_packages((const char *)data, (size_t)len);
-    pr_info("[selinux_hook] manager uid scan reason=%s len=%lld names=%u uids=%u\n",
-            reason ?: "(null)", len, READ_ONCE(g_manager_package_count),
-            READ_ONCE(g_manager_uid_count));
+    if (parse_apatch_manager_uid((const char *)data, (size_t)len, &uid)) {
+        WRITE_ONCE(g_apatch_manager_uid, uid);
+        pr_info("[selinux_hook] APatch manager uid detected package=%s uid=%d\n",
+                APATCH_MANAGER_PACKAGE, uid);
+    } else {
+        pr_warn("[selinux_hook] APatch manager uid not found package=%s\n",
+                APATCH_MANAGER_PACKAGE);
+    }
 
     vfree_fn(data);
-    return true;
-}
-
-/*
- * 解析重试：名单为空且有剩余预算时才真正读文件（否则是纯标志检查，
- * 对每次 /access 查询的开销可以忽略）。预算耗尽后不再重试。
- *
- * 预算只在「确实扫描过一次文件」时消耗（detect_manager_uids 返回 true）。
- * 早期 boot 阶段 /data 未挂载导致的 open 失败不占预算，因此等 /data 就绪后
- * 仍有机会修正名单 —— 这正是嵌入模式与临时加载模式行为不一致的根因。
- */
-static void try_refine_manager_uids(const char *reason)
-{
-    u32 budget;
-
-    if (READ_ONCE(g_manager_uid_count))
-        return;
-
-    budget = READ_ONCE(g_manager_uid_probe_budget);
-    if (!budget)
-        return;
-
-    if (!detect_manager_uids(reason))
-        return;
-
-    WRITE_ONCE(g_manager_uid_probe_budget, budget - 1);
-}
-
-/*
- * 加载参数解析（嵌入方法，参考 APKey_Hide 的 apk_parse_init_args）：
- *
- *   apd kpm load selinux_hook.kpm "pkg=me.yuki.aster"
- *
- * 接受 `pkg=NAME` / `mgr=NAME` / 裸 `NAME` 三种写法；无法通过包名校验的
- * 词元（如 "debug"、事件名等）直接忽略，不影响其他参数。
- */
-static void parse_init_args_packages(const char *args)
-{
-    const char *p = args;
-
-    if (!args)
-        return;
-
-    while (*p) {
-        const char *tok;
-        char name[MANAGER_PKG_NAME_MAX];
-        const char *candidate;
-        size_t len = 0;
-        size_t i;
-
-        while (*p == ' ' || *p == '\t' || *p == ',')
-            p++;
-        if (!*p)
-            break;
-
-        tok = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != ',') {
-            p++;
-            len++;
-        }
-
-        if (len >= MANAGER_PKG_NAME_MAX)
-            continue;
-
-        for (i = 0; i < len; i++)
-            name[i] = tok[i];
-        name[len] = '\0';
-
-        candidate = name;
-        if (len > 4 && name[3] == '=' &&
-            ((name[0] == 'p' && name[1] == 'k' && name[2] == 'g') ||
-             (name[0] == 'm' && name[1] == 'g' && name[2] == 'r')))
-            candidate = name + 4;
-
-        if (manager_pkg_valid(candidate))
-            manager_package_add(candidate);
-    }
 }
 static bool magiskinit_process_exists(void)
 {
@@ -2254,12 +1902,7 @@ static bool try_snapshot_mock_policy(const char *reason)
         return false;
     }
 
-    /*
-     * has_magisk 必须在改名**之前**算：它记录的是"这份快照本来脏不脏"这个事实。
-     * 改名只作用于快照副本，运行策略与强制访问控制行为完全不受影响。
-     */
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, (size_t)len));
-    (void)sanitize_blob_names((char *)data, (size_t)len);
     WRITE_ONCE(g_clean_policy_len, (size_t)len);
     WRITE_ONCE(g_clean_policy_blob, data);
     pr_info("[selinux_hook] CLEAN mock policy snapshot saved reason=%s path=%s blob=%px len=%zu has_magisk=%d\n",
@@ -2414,41 +2057,7 @@ static void snapshot_clean_policy(const char *reason)
         return;
     }
 
-    /*
-     * ================== 关键修复：先给快照改名，再存起来 ==================
-     *
-     * 这里是 APatch 上的实际路径：try_snapshot_mock_policy() 因为找不到
-     * magiskinit 而返回 false，于是快照直接取自 security_read_policy()，
-     * 也就是**已经被 magiskpolicy 改过的运行策略本身**。
-     * 真机 dmesg 实证：CLEAN policy snapshot saved reason=module_init ... has_magisk=1
-     *
-     * 这份 blob 会从**三个出口**流出去：
-     *
-     *   1) /sys/fs/selinux/policy 的读取 —— before_security_read_policy_common()
-     *      直接把 blob 拷给调用者；
-     *   2) policydb_read() 解析出的 g_clean_policydb —— ≥4.15 上 /context 与
-     *      /access 的答案出自这里；
-     *   3) clean_blob_has_name() 的文本查名。
-     *
-     * 真机取证（只读）：
-     *     dd if=/sys/fs/selinux/policy  → 1244440 字节，正好等于本快照 len
-     *     strings | grep -i magisk      → 命中 2 处："magisk"、"magisk_file"
-     * 也就是说，**任何能读 /sys/fs/selinux/policy 的进程 grep 一下 "magisk"
-     * 就得到 APatch 存在** —— 节点的 mode 是 -r--r--r--。判定层加多少 if 都拦不住
-     * 这个出口，因为泄漏的不是"回答"，而是策略文本本身。
-     *
-     * 这就是 解决了 fp/ap、之后的版本又回归"的原因：在保存快照时调了
-     * sanitize_blob_names()，而重新以原版 1.1.7 为基线重写时把它丢了。
-     *
-     * 改名的安全性：SELinux 二进制策略的符号表是 NUL 结尾的裸字符串，名字长度不
-     * 单独存储、引用偏移由 hashtab 记录 ⇒ **等长原地覆盖不移动任何偏移**，
-     * policydb_read 照旧解析。改名只作用于快照副本，**运行策略与 MAC 行为不变**，
-     * 且 magisk 与 ksu 自然对称（都变成不存在）。
-     *
-     * has_magisk 必须在改名**之前**算：它记录的是"这份快照本来脏不脏"这个事实。
-     */
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
-    (void)sanitize_blob_names((char *)data, len);
     WRITE_ONCE(g_clean_policy_len, len);
     WRITE_ONCE(g_clean_policy_blob, data);
     selinux_hook_dbg("[selinux_hook] CLEAN policy snapshot saved reason=%s blob=%px len=%zu has_magisk=%d\n",
@@ -2809,66 +2418,96 @@ static bool dirtysepolicy_avd_seqno_probe(const char *query, size_t len)
      *
      * 这条不是 allow/deny 探针，而是读取 /sys/fs/selinux/access 返回的
      * av_decision.seqno。只 patch /sys/fs/selinux/status 不够；这里直接识别
-     * 固定查询，并按"内核同形 + 与 /status 同一个记账值"作答
-     * （见 write_clean_access_seqno_response），避免 live policy seqno 泄漏。
+     * 固定查询并返回 clean seqno=1，避免 live policy seqno 泄漏。
      */
     return access_query_matches3(query, "u:r:untrusted_app:s0",
                                  "u:r:untrusted_app:s0", "0");
 }
 
 /*
- * 【1.5.4 fp/ap 修复】tclass==0 的 /sys/fs/selinux/access 应答。
- *
- * 上游（security/selinux/selinuxfs.c）**不校验 tclass**：
- *
- *     if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3) -> -EINVAL
- *     security_context_str_to_sid(scon / tcon)                -> -EINVAL 未命中
- *     security_compute_av_user(state, ssid, tsid, tclass, &avd);
- *     length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x",
- *                        avd.allowed, 0xffffffff,        <- 编译期常量，不是 avd 成员
- *                        avd.auditallow, avd.auditdeny,
- *                        avd.seqno, avd.flags);
- *
- * security_compute_av_user() 先走 avd_init()：
- *     allowed=0; auditallow=0; auditdeny=0xffffffff; seqno=latest_granting; flags=0;
- * 然后对 tclass==0 直接返回：
- *     if (unlikely(!tclass)) { if (policydb->allow_unknown) goto allow; goto out; }
- * （`allow:` 才会把 allowed 置 0xffffffff。）已有测试机策略 allow_unknown==0
- * （policy blob config==0xc0000001），所以 allowed 保持 0，干净 4.19 内核
- * 对这条探针的唯一可能应答就是
- *
- *     0 ffffffff 0 ffffffff <latest_granting> 0                  （25 字节）
- *
- * 已有测试机 4.19 的 latest_granting == 1，理由见 SELINUX_CLEAN_ACCESS_SEQNO 上方的注释。
- * 值本身沿用上游（单一常量，不按版本分支），这里只修**形状**。
- * 而 1.1.7 硬编码的 "0 0 0 0 1 0" 是 11 字节，第 2 字段 0、第 4 字段 0：
- * 前者在内核源码里是字面量 0xffffffff，后者由 avd_init() 从 0xffffffff 起步，
- * 长度还差 14 字节 —— 任何内核都产不出这个形状。检测器把
- * class=2 / "! ! 0" / class=0 三连打在同一个设备上，前两条（31 / -22）都合法，
- * 只有 class=0 这条形状不可能，等于自证被 hook。
+ * fp/ap 修复（推导式）：class==0 合成应答的每个字段都取自本机真实内核状态，
+ * 不硬编码任何值。实测发现硬编码（seqno 恒 1 / allowed 恒 0）会被
+ * "AV 决策序列异常" 和 "权限查询违反系统策略不变量" 抓住：
+ *   - seqno：本机 latest_granting 会随策略注入（reload）递增，与同会话
+ *     真实应答不一致 ⇒ 从未过滤路径的真实 /access 应答里采集（见
+ *     after_sel_write_common 的 observe_live_access_seqno）；
+ *   - allowed：由策略 blob 头部 config 的 ALLOW_UNKNOWN 位决定
+ *     （policydb->allow_unknown 的内核语义：class==0 时
+ *     goto allow ⇒ allowed=0xffffffff，否则保持 avd_init 的 0）；
+ *   - auditdeny=0xffffffff / flags=0：avd_init 初值，任何内核不变。
  */
+static u32 g_observed_access_seqno = 1;
+
+static void observe_live_access_seqno(const char *buf, ssize_t ret)
+{
+    const char *p = buf;
+    const char *end = buf + ret;
+    const char *tok;
+    u32 v = 0;
+    int t;
+
+    if (!buf || ret <= 0)
+        return;
+
+    for (t = 0; t < 4; t++) {
+        while (p < end && *p == ' ')
+            p++;
+        while (p < end && *p != ' ')
+            p++;
+    }
+    while (p < end && *p == ' ')
+        p++;
+    tok = p;
+    while (p < end && *p >= '0' && *p <= '9')
+        p++;
+    if (p == tok || p - tok > 10)
+        return;
+    while (tok < p)
+        v = v * 10 + (u32)(*tok++ - '0');
+    if (v)
+        WRITE_ONCE(g_observed_access_seqno, v);
+}
+
+/* blob 头部：magic(4) + "SE Linux"(8) + version(4) + config(4) ⇒ config 在偏移 16。 */
+static bool policy_blob_allow_unknown(void)
+{
+    const unsigned char *blob = (const unsigned char *)READ_ONCE(g_clean_policy_blob);
+
+    if (!blob)
+        return false;
+
+    return (get_u32_le(blob + 16) & 0x4) != 0;
+}
+
 static long write_clean_access_seqno_response(char *buf, size_t size)
 {
-    static const char head[] = "0 ffffffff 0 ffffffff ";
+    static const char head0[] = "0 ffffffff 0 ffffffff ";
+    static const char head1[] = "ffffffff ffffffff 0 ffffffff ";
     static const char tail[] = " 0";
+    const char *head;
+    size_t head_len;
     char digits[12];
-    u32 seq = SELINUX_CLEAN_ACCESS_SEQNO;
     size_t nd = 0;
     size_t len;
     size_t off;
+    u32 seq = READ_ONCE(g_observed_access_seqno);
 
+    if (!seq)
+        seq = 1;
     do {
         digits[nd++] = (char)('0' + (seq % 10));
         seq /= 10;
     } while (seq);
 
-    len = (sizeof(head) - 1) + nd + (sizeof(tail) - 1);
+    head = policy_blob_allow_unknown() ? head1 : head0;
+    head_len = (head == head1) ? (sizeof(head1) - 1) : (sizeof(head0) - 1);
+    len = head_len + nd + (sizeof(tail) - 1);
     if (!buf || size < len)
         return -EINVAL;
 
     off = 0;
-    copy_bytes(buf + off, head, sizeof(head) - 1);
-    off += sizeof(head) - 1;
+    copy_bytes(buf + off, head, head_len);
+    off += head_len;
     while (nd)
         buf[off++] = digits[--nd];
     copy_bytes(buf + off, tail, sizeof(tail) - 1);
@@ -2885,28 +2524,8 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     const char *src;
     const char *dst;
 
-    /*
-     * 【 修复】这里原本是：
-     *     if (!selinux_414_compat_path())
-     *         return false;
-     * 一行版本门控，把整张固定探针表**关成 4.19 上的死代码**。
-     *
-     * 上游的想法是"≥4.15 靠 clean policydb 重定向就能得到干净的 denied 结果"，
-     * 但那不成立：已有测试机实测 clean 基线**就是被 magiskpolicy 改过的运行策略**
-     * （dmesg: CLEAN baseline is the LIVE policy），重定向等于换个地方问同一份策略，
-     * 该允许的还是允许。于是检测器查 4 条探针，4 条都拿到真实答案：
-     *     u:r:system_server:s0 u:r:system_server:s0 2        → 2257ffd  (bit25 execmem 允许)
-     *     u:r:zygote:s0 u:object_r:adb_data_file:s0 8        → 10000000 (bit28 search  允许)
-     *     u:r:system_server:s0 u:object_r:apk_data_file:s0 6 → 1147fff  (execute 允许)
-     *     u:r:shell:s0 u:r:su:s0 2                           → 10000    (transition 允许)
-     * 这正是"fp/ap 没解决"的全部来源。去掉门控后这 4 条（以及表里另外 4 条）
-     * 一律返回 -EINVAL，与上游在 <4.15 上的既定行为一致。
-     *
-     * 注意：**只解开这一处**。同一个门控还包着 dirtysepolicy_context_should_hide()，
-     * 而那个函数喂给 /proc/self/attr/current 路径 —— 解开它会让 setcon("u:r:magisk:s0")
-     * 被拒，有直接弄坏 root 的风险；context 名的隐藏已经由 before_sel_write_context /
-     * _access 顶部的根标记闸门覆盖，不需要它。
-     */
+    if (!selinux_414_compat_path())
+        return false;
     if (!query || !len)
         return false;
 
@@ -3283,8 +2902,6 @@ static void after_selinux_policy_commit(hook_fargs2_t *a, void *u)
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
     try_complete_deferred_write_op_install("policy_commit");
-    /* 策略提交通常发生在系统起来之后，是补读 packages.list 的安全时机。 */
-    try_refine_manager_uids("policy_commit");
 }
 
 /*
@@ -3480,197 +3097,6 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 }
 
 /* Hook: /sys/fs/selinux/access write handler */
-/*
- * ===================== 根标记闸门（1.5.2，最小改动版） =====================
- *
- * 只做一件事：让**根标记名**在 /sys/fs/selinux/context 与 /access 上看起来不存在。
- *
- * 为什么必须"与基线无关"地下判断：已有测试机 dmesg 已经把基线说清楚了 ——
- *     CLEAN policy snapshot saved reason=module_init ... has_magisk=1
- *     CLEAN baseline is the LIVE policy (APatch patched boot sepolicy)
- * 也就是说上游那套 "clean 基线" 就是**被 magiskpolicy 改过的运行策略本身**，
- * u:r:magisk:s0 从第一次加载起就躺在里面，而 ksu 从来不在。任何"拿基线比一比"
- * 的路径都会给出 magisk 有 / ksu 没有 —— 这个不对称就是 APatch 指纹，
- * 且靠"让基线更干净"永远解不掉（信息差不在基线里，在"运行策略是被改过的"这个事实里）。
- *
- * 所以这里改成**与基线无关的不变量**：type 字段是根标记名 ⇒ 答"不存在"。
- * 按 '_' / '.' / '-' **分量**匹配（不是子串）：magisk_file 命中，而
- * bksu / filesystem_file 这类 stock 类型不会误伤。
- *
- * 与上游 1.1.7 的关系：本闸门是**纯新增**，只在 query 里出现根标记名时抢答
- * （-EINVAL，与干净设备同形）；其余任何 query 一律原样落回上游原有流程，
- * 不加版本门控、不改 seqno 记账、不换 policydb 来源。
- */
-#define ROOT_MARKER_COMPONENT_MAX 32
-
-static const char *const g_root_marker_components[] = {
-    "magisk", "magiskinit", "magiskpolicy", "magiskd",
-    "ksu", "ksud", "kernelsu", "sukisu",
-    "adbroot", "lsposed", "xposed",
-    "apatch", "kernelpatch", "kpatch",
-};
-
-static bool root_marker_component(const char *s, size_t len)
-{
-    size_t i;
-    size_t m;
-
-    if (!s || !len || len > ROOT_MARKER_COMPONENT_MAX)
-        return false;
-
-    for (m = 0; m < sizeof(g_root_marker_components) / sizeof(g_root_marker_components[0]); m++) {
-        const char *marker = g_root_marker_components[m];
-
-        if (str_len_safe(marker) != len)
-            continue;
-
-        for (i = 0; i < len; i++) {
-            if (!ascii_lower_eq(s[i], marker[i]))
-                break;
-        }
-        if (i == len)
-            return true;
-    }
-
-    return false;
-}
-
-/* SELinux 类型名允许的字符集，用于分量边界判定 */
-static bool marker_word_char(char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_';
-}
-
-/*
- * 'a'..'z' / 'A'..'Z' / '0'..'9' 各自右移一位（末尾回绕），其余字符不动。
- * 结果与原标记名**等长**，且既不是标记名、也不再包含标记名作为子串，
- * 所以 grep -i "magisk" 之类不会再命中。
- */
-static char shift_marker_byte(char c)
-{
-    if (c >= 'a' && c <= 'z')
-        return (char)('a' + (c - 'a' + 1) % 26);
-    if (c >= 'A' && c <= 'Z')
-        return (char)('A' + (c - 'A' + 1) % 26);
-    if (c >= '0' && c <= '9')
-        return (char)('0' + (c - '0' + 1) % 10);
-    return c;
-}
-
-/*
- * 把策略快照里的根标记名**原地等长改名**，返回改掉的个数。
- *
- * 调用点只有两处，都在保存快照时（try_snapshot_mock_policy /
- * snapshot_clean_policy），见那两处的长注释：这是让
- * /sys/fs/selinux/policy 这个"策略文本出口"不再泄漏 magisk/ksu 的唯一手段。
- *
- * 需要注意的边界（按"_"分量而不是子串判定）：
- *   magisk_file       里的 magisk → 改（右边是 '_'，后面还有分量）
- *   bksu_file         里的 ksu    → 不动（左邻 'b' 是名字字符）
- *   magiskish         里的 magisk → 不动（右邻 'i' 是名字字符，属于更长名字）
- *   magiskinit        里的 magisk → 让给它自己的条目处理
- */
-static u32 sanitize_blob_names(char *blob, size_t len)
-{
-    u32 hits = 0;
-    size_t m;
-
-    if (!blob || !len)
-        return 0;
-
-    for (m = 0; m < sizeof(g_root_marker_components) / sizeof(g_root_marker_components[0]); m++) {
-        const char *marker = g_root_marker_components[m];
-        size_t mlen = str_len_safe(marker);
-        size_t i;
-
-        if (!mlen || mlen > len)
-            continue;
-
-        for (i = 0; i + mlen <= len; i++) {
-            size_t j;
-
-            /* 先用首字节筛掉绝大多数位置，再谈边界 */
-            if (!ascii_lower_eq(blob[i], marker[0]))
-                continue;
-            /* 左边界：名字开头或非名字字符 */
-            if (i > 0 && marker_word_char(blob[i - 1]))
-                continue;
-            /*
-             * 右边界：非名字字符或 '_' 都可以改（'_' 后面还有分量）；
-             * 其它名字字符说明它只是更长名字的一截，跳过。
-             */
-            if (i + mlen < len) {
-                char right = blob[i + mlen];
-
-                if (right != '_' && marker_word_char(right))
-                    continue;
-            }
-
-            for (j = 0; j < mlen; j++) {
-                if (!ascii_lower_eq(blob[i + j], marker[j]))
-                    break;
-            }
-            if (j != mlen)
-                continue;
-
-            for (j = 0; j < mlen; j++)
-                blob[i + j] = shift_marker_byte(blob[i + j]);
-
-            hits++;
-            i += mlen - 1;
-        }
-    }
-
-    return hits;
-}
-
-/*
- * 取 context 的第 3 个 ':' 字段（type），按分量比对。
- * 字段不足 3 个（不是完整 context）就不插手。
- */
-static bool root_marker_context(const char *query)
-{
-    const char *ctx = skip_spaces(query);
-    size_t len = token_len(ctx);
-    size_t first = (size_t)-1;
-    size_t second = (size_t)-1;
-    size_t third = (size_t)-1;
-    size_t start;
-    size_t i;
-
-    for (i = 0; i < len; i++) {
-        if (ctx[i] != ':')
-            continue;
-        if (first == (size_t)-1)
-            first = i;
-        else if (second == (size_t)-1)
-            second = i;
-        else {
-            third = i;
-            break;
-        }
-    }
-
-    if (second == (size_t)-1)
-        return false;
-    if (third == (size_t)-1)
-        third = len;
-    if (third <= second + 1)
-        return false;
-
-    start = second + 1;
-    for (i = start; i <= third; i++) {
-        if (i == third || ctx[i] == '_' || ctx[i] == '.' || ctx[i] == '-') {
-            if (root_marker_component(ctx + start, i - start))
-                return true;
-            start = i + 1;
-        }
-    }
-
-    return false;
-}
-
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
     // if (current_uid() < 10000 || current_is_policy_manager()) {
@@ -3692,79 +3118,9 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
 
-    /*
-     * 名单为空时借 root（uid==0）的查询事件补解析 —— APKey_Hide 的
-     * uid-0 触发机制：packages.list 只有特权上下文读得到，而 apd 恰好
-     * 以 uid 0 发起 /access 探测。预算内最多重试 4 次，平时是纯标志检查。
-     */
-    if (uid == 0)
-        try_refine_manager_uids("access-uid0");
-
-    /*
-     * 放行 0：受信策略管理路径（先于根标记闸门）。
-     *
-     * 两个组成，都基于**不可伪造**的身份：
-     *   · 内部 root 名单 UID —— 由 packages.list 里的管理器包名
-     *     （me.yuki.folk / me.yuki.aster / me.bmax.apatch，可经加载参数或
-     *     ctl0 追加）映射而来。UID 是内核凭证，普通进程改不了，因此这个
-     *     例外不构成下面闸门注释所反对的 comm 仿冒 oracle。
-     *   · uid<10000 且 comm 命中 apd/magiskpolicy/truncate 的策略管理路径
-     *     （维持原有约束：普通 app 改 comm 也进不来）。
-     *
-     * 若把这条例外放到根标记闸门之后（beta-4 的做法），apd/管理器对
-     * kpatch/apatch/magisk 相关上下文的探测会先被闸门答 -EINVAL：管理器
-     * 由此判定"无 root"，重启 / 授权 / root 应用列表全部失效，apd 的策略
-     * 加载探测同样被误伤。
-     *
-     * adb shell(2000) 与普通 app（uid>=10000 且不在名单）仍落入下面的 clean
-     * 分支；其中普通 app 另受源侧根标记闸门（闸门 1b）约束，检测面不变。
-     */
-    if (current_is_policy_manager()) {
-        if (should_log_live_bypass(uid))
-            log_bypass_once("access", uid, sample);
-        return;
-    }
-
-    /*
-     * 闸门 1a（目标侧）：根标记名 ⇒ 答"不存在"。
-     *
-     * ★★ 对未被放行 0 覆盖的调用者，这个判定**与身份无关**（不看 uid、
-     * 不看 comm）。理由：干净策略里这些 type 名根本不存在，
-     * security_context_to_sid() 对不存在的 type **一律**返回 -EINVAL ——
-     * 所以"对所有身份一律 -EINVAL"才是与干净设备**逐位同形**的答案，
-     * 也是唯一同时覆盖 magisk / ksu / 任何未来 root 方案的答案。
-     *
-     * /access 的 query 是 "<source> <target> <class>"，这里只看 **target** 侧，
-     * 覆盖 "u:r:untrusted_app:s0 u:r:magisk:s0 6" 这类目标侧探针；target 侧不
-     * 受调用者身份影响，所以保持身份无关，且必须先于下面的特权放行。
-     */
-    if (root_marker_context(next_token(sample))) {
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
-        return;
-    }
-
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("access", uid, sample);
-        return;
-    }
-
-    /*
-     * 闸门 1b（源侧）：仅对非特权 caller 隐藏。
-     *
-     * 源侧 token 是**调用者自己的上下文**。servicemanager 代任何 magisk 域
-     * root shell 做 selinux_check_access() 时，会往 /access 写
-     * "u:r:magisk:s0 <target> <class>"：若此时答 -EINVAL，用户态 libselinux
-     * 把它当成判决失败，于是**所有** magisk 域进程都找不到任何 binder 服务
-     * （libsu RootServerMain 拿不到 IPackageManager 即退出，管理器 app 列表
-     * 因此为空）。放在特权放行之后后，uid<10000（init/servicemanager/apd）
-     * 与 manager 先拿真实答案，与它们在 /policy 上看到的口径一致；
-     * uid>=10000 的 App 探针仍被隐藏，**检测面不变**。
-     */
-    if (root_marker_context(sample)) {
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
         return;
     }
 
@@ -3902,44 +3258,9 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid = current_uid();
     sample_len = copy_query_sample(sample, query, size);
 
-    /*
-     * 与 before_sel_write_access() 相同：名单为空时借 uid==0 的查询事件
-     * 补解析 packages.list（/context 与 /access 一样是 init/apd 的热路径，
-     * 两条路径都要有触发点，避免只走 /context 的场景下名单永远不修正）。
-     */
-    if (uid == 0)
-        try_refine_manager_uids("context-uid0");
-
-    /*
-     * 放行 0：受信策略管理路径（先于根标记闸门），理由与
-     * before_sel_write_access() 里的放行 0 注释逐字相同：
-     * 内部 root 名单 UID（packages.list 包名映射，不可伪造）+
-     * uid<10000 的 apd/magiskpolicy 策略管理路径先拿真实答案，否则
-     * 管理器/apd 对 kpatch/apatch/magisk 相关上下文的查询被闸门答
-     * -EINVAL，管理器误判"无 root"。
-     *
-     * 对未被放行 0 覆盖的调用者，下面的根标记闸门仍然隐藏：/context 的答
-     * "不存在"在 stock 设备上就是 -EINVAL，与干净设备同形；且对 magisk 与
-     * ksu 给出**同一个**答案，不对称消失。但它必须排在特权放行**之后**：
-     * /context 的 query 就是被查询的上下文本身，调用者常常是拿自己的域来问
-     * （servicemanager/init 代 magisk 域进程查 sid），提前答 -EINVAL 会让
-     * 这些合法查询拿不到真实 sid。
-     */
-    if (current_is_policy_manager()) {
-        if (should_log_live_bypass(uid))
-            log_bypass_once("context", uid, sample);
-        return;
-    }
-
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("context", uid, sample);
-        return;
-    }
-
-    if (root_marker_context(sample)) {
-        a->skip_origin = 1;
-        a->ret = -EINVAL;
         return;
     }
 
@@ -4030,8 +3351,16 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     u32 slot;
     u32 mode;
 
-    if (!a->local.data0)
+    if (!a->local.data0) {
+        /*
+         * 未过滤路径的真实 live 应答：采集本机 latest_granting，
+         * 供 class==0 合成应答使用（fp/ap 修复的 seqno 推导）。
+         * /context 应答不是 6 字段数字格式，解析器会自然拒绝。
+         */
+        if ((long)a->ret > 0)
+            observe_live_access_seqno((const char *)a->arg1, (ssize_t)a->ret);
         return;
+    }
 
     mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
@@ -4045,14 +3374,10 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
 
     live_ret = (long)a->ret;
 
-    /* Rewrite the seqno field of an /access response.  That field is
-     * avd_init()'s avd->seqno = latest_granting, which is a different counter
-     * from the /status sequence and is not supposed to equal it; the single
-     * constant keeps the value reachable on every kernel version. */
+    /* Patch seqno in the access response buffer to match /sys/fs/selinux/status */
     if (live_ret > 0 && probe->node && probe->node[0] == 'a') {
         char *rbuf = (char *)a->arg1;
-        ssize_t new_ret = patch_response_seqno(rbuf, live_ret,
-                                               SELINUX_CLEAN_ACCESS_SEQNO);
+        ssize_t new_ret = patch_response_seqno(rbuf, live_ret, 1);
         if (new_ret > 0) {
             live_ret = new_ret;
             a->ret = (uint64_t)new_ret;
@@ -4294,33 +3619,6 @@ static int install_write_op_hooks(void)
         }
         return 0;
     }
-
-    /*
-     * ============================ 不要在这里打 write_op[] 表 ============================
-     *
-     * 踩过的坑（1.5.0，真机 4.19 直接加载失败）：曾让控制流从上面继续走到下面的
-     * write_op[] 打表分支，理由是"表项才是间接分派入口"。结果：
-     *
-     *   [selinux_hook] symbol write_op  found addr=ffffff9f37582418
-     *   [selinux_hook] patch write_op access failed rc=-2
-     *   [+] KP I load_module_ex: [selinux_magisk_access_filter] failed with [(null)] error: -2, try exit ...
-     *
-     * rc=-2 来自 patch_kernel_ulong() → lookup_kernel_pgd() 返回 NULL：
-     * 它靠 lookup_name_optional_suffix("swapper_pg_dir"/"init_pg_dir") 取内核 PGD，
-     * 而**已有测试机内核 kallsyms 里这两个符号都不存在**（实测各 0 命中；
-     * 但 selinux_transaction_write / sel_write_access 都在）。即：改写那张只读表
-     * 在这台设备上**永远不可能成功**，而这个错误一路上抛到 init() ⇒ 加载器回滚卸载。
-     *
-     * 更关键的是：inline hook **本来就是有效的**。真机 dmesg 里能看到
-     *   CLEAN /sys/fs/selinux/access  #2 uid=1000 comm=servicemanager ...
-     *   CLEAN /sys/fs/selinux/context #24 uid=1000 comm=main ...
-     * 这些都出自 before_sel_write_access / before_sel_write_context，
-     * 证明这两个 before 钩子确实在调用链上。之前误判"钩子没生效"，是因为
-     * 上游 should_bypass_clean_filter() 对 uid<10000 直接 return，
-     * 而当时的探针是以 root 跑的 —— 静默走了旁路，并非钩子失效。
-     *
-     * 所以：保留 inline hook，**保持上游的 return 0**，不要碰那张只读表。
-     */
 
     /*
      * write_op[] fallback notes:
@@ -4805,8 +4103,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
                 (void *)a->arg1, (size_t)a->arg2, (void *)a->arg3,
                 pos_before, ret, pos_after, g_copy_to_user_name ?: "compat_copy_to_user",
                 SELINUX_KERNEL_STATUS_VERSION,
-                clean_status_sequence(),
-                clean_status_policyload());
+                SELINUX_STATUS_CLEAN_SEQUENCE,
+                SELINUX_STATUS_CLEAN_POLICYLOAD);
 
     if (ret < 0)
         return;
@@ -4818,8 +4116,8 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
     a->ret = (uint64_t)ret;
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%d comm=%s ret=%zd sequence=%u policyload=%u copy=%s\n",
                      n, uid, current_comm(), ret,
-                     clean_status_sequence(),
-                     clean_status_policyload(),
+                     SELINUX_STATUS_CLEAN_SEQUENCE,
+                     SELINUX_STATUS_CLEAN_POLICYLOAD,
                      g_copy_to_user_name ?: "compat_copy_to_user");
 }
 
@@ -4858,8 +4156,8 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
     WRITE_ONCE(g_status_read_count, n);
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/status #%u uid=%u comm=%s mode=simple_read ret=%ld sequence=%u policyload=%u\n",
                      n, (u32)a->local.data3, current_comm(), (long)a->ret,
-                     clean_status_sequence(),
-                     clean_status_policyload());
+                     SELINUX_STATUS_CLEAN_SEQUENCE,
+                     SELINUX_STATUS_CLEAN_POLICYLOAD);
 }
 
 static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
@@ -5035,36 +4333,9 @@ static long init(const char *args, const char *event, void *__user r)
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
-    /*
-     * 内部 root 名单（全内核生效 / all kernels）：重置内置包名表 →
-     * 解析加载参数追加（嵌入方法）→ 应用编译期预设 UID → 解析
-     * packages.list 得到管理器 UID，供 current_is_policy_manager() 使用。
-     */
-    manager_packages_reset_defaults();
-    parse_init_args_packages(args);
-    if (APATCH_MANAGER_UID != (uid_t)-1)
-        manager_uid_add((uid_t)APATCH_MANAGER_UID, "preset");
-    detect_manager_uids("module_init");
-
-    /*
-     * 第二信任源（KP 原生签名级锚点，参考 APKey_Hide v3.6）：
-     * `is_trusted_manager_uid_android()` 由 KernelPatch 自己在 supercall 路径
-     * 维护，其值来自签名校验，与「/data 是否已挂载」「packages.list 能否读到」
-     * 完全无关 —— 嵌入模式下 /data 未挂载时这就是唯一可信的身份来源。
-     *
-     * 用 symbol_lookup_name 运行时解析而非 extern 引用：只有 Android 分支的
-     * KP 才导出该符号，直接 extern 会让非 Android 分支的模块因 SHN_UNDEF
-     * 解析失败而不加载（module.c simplify_symbols 对未定义符号返回 -ENOENT）。
-     * 解析不到时仅降级为「无此信任源」，不影响其他功能。
-     */
-    g_kp_trusted_manager_fn =
-        (kp_trusted_manager_fn_t)symbol_lookup_name("is_trusted_manager_uid_android");
-    if (g_kp_trusted_manager_fn)
-        pr_info("[selinux_hook] auth anchor: is_trusted_manager_uid_android=%px\n",
-                (void *)g_kp_trusted_manager_fn);
-    else
-        pr_warn("[selinux_hook] auth anchor unavailable: is_trusted_manager_uid_android not exported by this KernelPatch\n");
-
+    /* 4.9 only / 仅 4.9：解析 APatch 管理器 UID，供 current_is_policy_manager() 使用。 */
+    if (selinux_49_compat_path())
+        detect_apatch_manager_uid();
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
     security_load_policy_compat_fn = (void *)security_load_policy_fn;
     security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
@@ -5363,103 +4634,27 @@ static long exit_(void *__user r)
     selinux_hook_dbg("[selinux_hook] exited\n");
     return 0;
 }
-static bool str_starts_with_lit(const char *s, const char *pre)
-{
-    size_t i;
+static long control(const char* args, char* __user out_msg, int outlen) {
 
-    if (!s)
-        return false;
+    int rc = 0;
+    char echo[64];
 
-    for (i = 0; pre[i]; i++) {
-        if (s[i] != pre[i])
-            return false;
-    }
-
-    return true;
-}
-
-static bool parse_uid_arg(const char *s, uid_t *out)
-{
-    unsigned long value = 0;
-    bool any = false;
-
-    for (; *s; s++) {
-        if (*s < '0' || *s > '9')
-            return false;
-        any = true;
-        value = value * 10 + (unsigned long)(*s - '0');
-        if (value > 10000000UL)
-            return false;
-    }
-
-    if (!any)
-        return false;
-
-    *out = (uid_t)value;
-    return true;
-}
-
-/*
- * 运行时控制通道（kpuctl / apd supercall）：
- *   mgrname=<pkg>   追加管理器包名并立即重解析 packages.list
- *   mgruid=<uid>    直接追加管理器 UID（包名解析失败时的兜底）
- *   status          输出名单状态（包名/UID 数量、UID 列表、重试预算）
- * 其他命令保持原来的 "success resp" 回显，兼容既有工具链。
- */
-static long control(const char *args, char *__user out_msg, int outlen)
-{
-    char msg[192];
-    size_t off = 0;
-    u32 i;
-
-    (void)outlen;
-    zero_bytes(msg, sizeof(msg));
-
-    if (args && str_starts_with_lit(args, "mgrname=")) {
-        const char *pkg = args + 8;
-
-        if (manager_pkg_valid(pkg) && manager_package_add(pkg)) {
-            WRITE_ONCE(g_manager_uid_probe_budget, MANAGER_UID_PROBE_BUDGET);
-            try_refine_manager_uids("ctl0-mgrname");
-            sprintf(msg, "ok mgrname added names=%u uids=%u\n",
-                    READ_ONCE(g_manager_package_count),
-                    READ_ONCE(g_manager_uid_count));
-        } else {
-            sprintf(msg, "error bad pkg or table full\n");
+    zero_bytes(echo, sizeof(echo));
+    if (rc < 0) {
+    sprintf(echo, "error, rc=%d\n", rc);
+        logke("fg_sram_write %s", echo);
+        if (out_msg) {
+            compat_copy_to_user(out_msg, echo, sizeof(echo));
+            return 1;
         }
-    } else if (args && str_starts_with_lit(args, "mgruid=")) {
-        uid_t uid;
-
-        if (parse_uid_arg(args + 7, &uid) && manager_uid_add(uid, "ctl0")) {
-            sprintf(msg, "ok mgruid added uids=%u\n",
-                    READ_ONCE(g_manager_uid_count));
-        } else {
-            sprintf(msg, "error bad uid or table full\n");
-        }
-    } else if (args && str_eq_lit(args, "status")) {
-        /*
-         * anchor=1 表示 KP 原生签名级锚点（is_trusted_manager_uid_android）
-         * 解析成功。核验嵌入模式时这是关键字段：anchor=0 且 uids=0 说明
-         * 信任链只剩 packages.list 一条，需要检查 KP 是否导出了该符号。
-         */
-        off += (size_t)sprintf(msg + off, "names=%u uids=%u budget=%u anchor=%d uids:",
-                               READ_ONCE(g_manager_package_count),
-                               READ_ONCE(g_manager_uid_count),
-                               READ_ONCE(g_manager_uid_probe_budget),
-                               g_kp_trusted_manager_fn ? 1 : 0);
-        for (i = 0; i < READ_ONCE(g_manager_uid_count) &&
-                    i < MANAGER_UID_MAX && off + 16 < sizeof(msg);
-             i++)
-            off += (size_t)sprintf(msg + off, " %d",
-                                   READ_ONCE(g_manager_uids[i]));
-        sprintf(msg + off, "\n");
     } else {
-        sprintf(msg, "success resp\n");
+        sprintf(echo, "success resp\n");
+        logki("fg_sram_write %s", echo);
+        if (out_msg) {
+            compat_copy_to_user(out_msg, echo, sizeof(echo));
+            return 0;
+        }
     }
-
-    if (out_msg)
-        compat_copy_to_user(out_msg, msg, sizeof(msg));
-
     return 0;
 }
 KPM_INIT(init);

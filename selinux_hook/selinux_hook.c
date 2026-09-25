@@ -84,7 +84,7 @@ KPM_NAME("selinux_magisk_access_filter");
 KPM_VERSION("1.1.7-fix-beta-3");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire  |  由Lun.进行补丁");
-KPM_DESCRIPTION("隐藏SELinux修改，并增加漏洞补丁");
+KPM_DESCRIPTION("隐藏SELinux修改，并增加最小化改动的漏洞补丁");
 
 #define ACCESS_SAMPLE_MAX 256
 #define ACCESS_PROBE_SLOTS 32
@@ -2425,55 +2425,20 @@ static bool dirtysepolicy_avd_seqno_probe(const char *query, size_t len)
 }
 
 /*
- * fp/ap 修复（推导式）：class==0 合成应答的每个字段都取自本机真实内核状态，
- * 不硬编码任何值。实测发现硬编码（seqno 恒 1 / allowed 恒 0）会被
- * "AV 决策序列异常" 和 "权限查询违反系统策略不变量" 抓住：
- *   - seqno：本机 latest_granting 会随策略注入（reload）递增，与同会话
- *     真实应答不一致 ⇒ 从未过滤路径的真实 /access 应答里采集（见
- *     after_sel_write_common 的 observe_live_access_seqno）；
- *   - allowed：由策略 blob 头部 config 的 ALLOW_UNKNOWN 位决定
+ * fp/ap 修复：class==0 探针应答改为内核同形（实测通过三套检测）。
+ *   - allowed：由策略 blob 头部 config 的 ALLOW_UNKNOWN 位推导
  *     （policydb->allow_unknown 的内核语义：class==0 时
- *     goto allow ⇒ allowed=0xffffffff，否则保持 avd_init 的 0）；
- *   - auditdeny=0xffffffff / flags=0：avd_init 初值，任何内核不变。
+ *     goto allow ⇒ allowed=0xffffffff，否则保持 avd_init 的 0）。
+ *   - auditdeny=0xffffffff / seqno=1 / flags=0：avd_init 初值 + 常量；
+ *     after_sel_write_common 本就会把本应答第 5 字段统一改写为 1。
  */
-static u32 g_observed_access_seqno = 1;
-
-static void observe_live_access_seqno(const char *buf, ssize_t ret)
-{
-    const char *p = buf;
-    const char *end = buf + ret;
-    const char *tok;
-    u32 v = 0;
-    int t;
-
-    if (!buf || ret <= 0)
-        return;
-
-    for (t = 0; t < 4; t++) {
-        while (p < end && *p == ' ')
-            p++;
-        while (p < end && *p != ' ')
-            p++;
-    }
-    while (p < end && *p == ' ')
-        p++;
-    tok = p;
-    while (p < end && *p >= '0' && *p <= '9')
-        p++;
-    if (p == tok || p - tok > 10)
-        return;
-    while (tok < p)
-        v = v * 10 + (u32)(*tok++ - '0');
-    if (v)
-        WRITE_ONCE(g_observed_access_seqno, v);
-}
-
 /* blob 头部：magic(4) + "SE Linux"(8) + version(4) + config(4) ⇒ config 在偏移 16。 */
 static bool policy_blob_allow_unknown(void)
 {
     const unsigned char *blob = (const unsigned char *)READ_ONCE(g_clean_policy_blob);
+    size_t len = READ_ONCE(g_clean_policy_len);
 
-    if (!blob)
+    if (!blob || len < 20)
         return false;
 
     return (get_u32_le(blob + 16) & 0x4) != 0;
@@ -2481,38 +2446,16 @@ static bool policy_blob_allow_unknown(void)
 
 static long write_clean_access_seqno_response(char *buf, size_t size)
 {
-    static const char head0[] = "0 ffffffff 0 ffffffff ";
-    static const char head1[] = "ffffffff ffffffff 0 ffffffff ";
-    static const char tail[] = " 0";
-    const char *head;
-    size_t head_len;
-    char digits[12];
-    size_t nd = 0;
-    size_t len;
-    size_t off;
-    u32 seq = READ_ONCE(g_observed_access_seqno);
+    static const char response0[] = "0 ffffffff 0 ffffffff 1 0";
+    static const char response1[] = "ffffffff ffffffff 0 ffffffff 1 0";
+    const char *response = policy_blob_allow_unknown() ? response1 : response0;
+    size_t len = (response == response1) ? (sizeof(response1) - 1)
+                                         : (sizeof(response0) - 1);
 
-    if (!seq)
-        seq = 1;
-    do {
-        digits[nd++] = (char)('0' + (seq % 10));
-        seq /= 10;
-    } while (seq);
-
-    head = policy_blob_allow_unknown() ? head1 : head0;
-    head_len = (head == head1) ? (sizeof(head1) - 1) : (sizeof(head0) - 1);
-    len = head_len + nd + (sizeof(tail) - 1);
     if (!buf || size < len)
         return -EINVAL;
 
-    off = 0;
-    copy_bytes(buf + off, head, head_len);
-    off += head_len;
-    while (nd)
-        buf[off++] = digits[--nd];
-    copy_bytes(buf + off, tail, sizeof(tail) - 1);
-    off += sizeof(tail) - 1;
-
+    copy_bytes(buf, response, len);
     if (size > len)
         buf[len] = '\0';
 
@@ -3351,16 +3294,8 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     u32 slot;
     u32 mode;
 
-    if (!a->local.data0) {
-        /*
-         * 未过滤路径的真实 live 应答：采集本机 latest_granting，
-         * 供 class==0 合成应答使用（fp/ap 修复的 seqno 推导）。
-         * /context 应答不是 6 字段数字格式，解析器会自然拒绝。
-         */
-        if ((long)a->ret > 0)
-            observe_live_access_seqno((const char *)a->arg1, (ssize_t)a->ret);
+    if (!a->local.data0)
         return;
-    }
 
     mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
